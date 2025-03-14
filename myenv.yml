@@ -1,0 +1,52 @@
+name: misinfo-detection
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip=23.0
+  - pytorch=2.0.1
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=11.8  # Change to match your CUDA version
+  - cudatoolkit=11.8   # Change to match your CUDA version
+  - numpy=1.24.3
+  - pandas=2.0.1
+  - scikit-learn=1.2.2
+  - matplotlib=3.7.1
+  - seaborn=0.12.2
+  - jupyter=1.0.0
+  - ipywidgets=8.0.6
+  - tqdm=4.65.0
+  - pip:
+    - transformers>=4.30.0
+    - datasets>=2.12.0
+    - peft>=0.4.0
+    - bitsandbytes>=0.39.0
+    - accelerate>=0.20.0
+    - optimum>=1.8.0
+    - optuna>=3.2.0
+    - plotly>=5.14.0
+    - spacy>=3.5.0
+    - nltk>=3.8.0
+    - unidecode>=1.3.6
+    - contractions>=0.1.73
+    - psutil>=5.9.0
+
+# Post-install commands - will be executed after the environment is created
+variables:
+  PYTORCH_CUDA_ALLOC_CONF: max_split_size_mb:512
+
+# To create this environment:
+# conda env create -f environment.yml
+# 
+# To activate:
+# conda activate misinfo-detection
+#
+# To install spaCy model after activation:
+# python -m spacy download en_core_web_sm
+#
+# To download NLTK data:
+# python -c "import nltk; nltk.download('vader_lexicon')"

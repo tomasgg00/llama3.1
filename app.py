@@ -19,10 +19,17 @@ from pathlib import Path
 import torch
 import pandas as pd
 from datetime import datetime
+import shutil
 
 # Setup path for local imports
 current_dir = Path(__file__).parent
 sys.path.append(str(current_dir))
+
+# Add this import to enable adaptive scaling features
+from integration_code import patch_app_main
+
+# Call this to patch the app with adaptive scaling features
+patch_app_main()
 
 from src.utils import setup_logging, ProgressTracker, get_available_device
 from src.config import (
@@ -45,6 +52,9 @@ def setup_parser():
     preprocess_parser.add_argument("--dataset", required=True, help="Dataset name (without extension)")
     preprocess_parser.add_argument("--no-balance", action="store_true", help="Skip dataset balancing")
     preprocess_parser.add_argument("--batch-size", type=int, default=1000, help="Batch size for processing")
+    preprocess_parser.add_argument("--sample", action="store_true", help="Sample the dataset if it's too large")
+    preprocess_parser.add_argument("--max-samples", type=int, default=100000, help="Maximum number of samples to use")
+    preprocess_parser.add_argument("--sampling-strategy", choices=['stratified', 'random'], default='stratified', help="Sampling strategy to use")
     
     # Train command
     train_parser = subparsers.add_parser("train", help="Train a model")
@@ -109,7 +119,10 @@ def preprocess_command(args):
     df = load_and_preprocess(
         args.dataset,
         balance=balance,
-        progress_tracker=None
+        progress_tracker=None,
+        sample_dataset=args.sample,
+        max_samples=args.max_samples,
+        sampling_strategy=args.sampling_strategy
     )
     
     if df is not None:
@@ -131,12 +144,16 @@ def train_command(args):
     logger = logging.getLogger()
     logger.info(f"Training model using dataset: {args.dataset}")
     
-    # Set output directory
+    # Set output directory using dataset name 
     if args.output:
         output_dir = args.output
     else:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = os.path.join(MODELS_DIR, f"model_{timestamp}")
+        output_dir = os.path.join(MODELS_DIR, args.dataset)
+    
+    # Delete the directory if it exists to avoid accumulating files
+    if os.path.exists(output_dir):
+        logger.info(f"Removing existing directory: {output_dir}")
+        shutil.rmtree(output_dir)
     
     os.makedirs(output_dir, exist_ok=True)
     
@@ -185,14 +202,15 @@ def train_command(args):
     
     # Train model
     results = train_model(
-        model=model,
-        tokenizer=tokenizer,
-        train_df=train_df,
-        eval_df=val_df,
-        output_dir=output_dir,
-        training_args=None,  # Use defaults
-        class_weights=None,  # Calculate automatically
-        use_enhanced_prompt=not args.no_enhanced_prompt
+    model=model,
+    tokenizer=tokenizer,
+    train_df=train_df,
+    eval_df=val_df,
+    output_dir=output_dir,
+    training_args=None,  # Use defaults
+    class_weights=None,  # Calculate automatically
+    use_enhanced_prompt=not args.no_enhanced_prompt,
+    auto_batch_size=args.auto_batch_size if hasattr(args, 'auto_batch_size') else False
     )
     
     if results:
@@ -212,12 +230,16 @@ def optimize_command(args):
     logger = logging.getLogger()
     logger.info(f"Running hyperparameter optimization using dataset: {args.dataset}")
     
-    # Set output directory
+    # Set output directory using dataset name
     if args.output:
         output_dir = args.output
     else:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = os.path.join(MODELS_DIR, f"hpo_{timestamp}")
+        output_dir = os.path.join(MODELS_DIR, f"hpo_{args.dataset}")
+    
+    # Delete the directory if it exists to avoid accumulating files
+    if os.path.exists(output_dir):
+        logger.info(f"Removing existing directory: {output_dir}")
+        shutil.rmtree(output_dir)
     
     os.makedirs(output_dir, exist_ok=True)
     
@@ -243,8 +265,14 @@ def optimize_command(args):
         logger.info(f"Hyperparameter optimization completed successfully")
         logger.info(f"Best parameters: {study_results['best_trial']['params']}")
         
-        # Train final model with best parameters
-        final_model_dir = os.path.join(output_dir, "final_model")
+        # Train final model with best parameters and save in dataset folder
+        final_model_dir = os.path.join(MODELS_DIR, args.dataset)
+        
+        # Delete the directory if it exists to avoid accumulating files
+        if os.path.exists(final_model_dir):
+            logger.info(f"Removing existing directory: {final_model_dir}")
+            shutil.rmtree(final_model_dir)
+            
         os.makedirs(final_model_dir, exist_ok=True)
         
         logger.info(f"Training final model with best parameters")
@@ -266,6 +294,141 @@ def optimize_command(args):
             return False
     else:
         logger.error("Hyperparameter optimization failed")
+        return False
+
+# Additions for app.py to enable DeepSpeed
+
+def add_deepspeed_args(parser):
+    """Add DeepSpeed arguments to the parser."""
+    parser.add_argument("--deepspeed", action="store_true", help="Use DeepSpeed for training")
+    parser.add_argument("--zero-stage", type=int, choices=[0, 1, 2, 3], 
+                       help="DeepSpeed ZeRO stage (0, 1, 2, or 3)")
+    parser.add_argument("--offload-optimizer", action="store_true", 
+                       help="Offload optimizer states to CPU")
+    parser.add_argument("--offload-parameters", action="store_true", 
+                       help="Offload parameters to CPU (ZeRO-3 only)")
+    parser.add_argument("--no-auto-detect", action="store_true", 
+                       help="Disable auto-detection of optimal DeepSpeed config")
+    return parser
+
+def setup_parser_with_deepspeed():
+    """Set up command-line argument parser with DeepSpeed arguments."""
+    parser = setup_parser()  # Call original setup_parser
+    
+    # Add DeepSpeed arguments to specific commands
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for cmd, subparser in action.choices.items():
+                # Add to train, optimize, and pipeline commands
+                if cmd in ['train', 'optimize', 'pipeline']:
+                    add_deepspeed_args(subparser)
+    
+    return parser
+
+def modify_train_command(args):
+    """Modified train_command function that supports DeepSpeed."""
+    from src.model import (
+        get_tokenizer, load_base_model, prepare_for_lora, 
+        apply_lora, get_lora_config
+    )
+    from src.training import train_model, train_model_with_deepspeed
+    from src.preprocessing import load_processed_dataset
+    
+    logger = logging.getLogger()
+    logger.info(f"Training model using dataset: {args.dataset}")
+    
+    # Set output directory using dataset name 
+    if args.output:
+        output_dir = args.output
+    else:
+        output_dir = os.path.join(MODELS_DIR, args.dataset)
+    
+    # Delete the directory if it exists to avoid accumulating files
+    if os.path.exists(output_dir):
+        logger.info(f"Removing existing directory: {output_dir}")
+        shutil.rmtree(output_dir)
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Load datasets
+    train_df = load_processed_dataset(args.dataset, "train")
+    val_df = load_processed_dataset(args.dataset, "val")
+    
+    if train_df is None or val_df is None:
+        logger.error("Failed to load datasets")
+        return False
+    
+    # Load tokenizer
+    tokenizer = get_tokenizer(args.model)
+    if tokenizer is None:
+        logger.error("Failed to load tokenizer")
+        return False
+    
+    # Load base model
+    base_model = load_base_model(
+        model_name=args.model,
+        quantize=True,
+        device_map="auto"
+    )
+    
+    if base_model is None:
+        logger.error("Failed to load base model")
+        return False
+    
+    # Configure LoRA
+    lora_config = get_lora_config(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha
+    )
+    
+    # Prepare model for LoRA and apply LoRA
+    prepared_model = prepare_for_lora(base_model)
+    model = apply_lora(prepared_model, lora_config)
+    
+    # Check if DeepSpeed is requested
+    if hasattr(args, 'deepspeed') and args.deepspeed:
+        # Configure DeepSpeed
+        deepspeed_config = {
+            "zero_stage": args.zero_stage if args.zero_stage is not None else 2,
+            "offload_optimizer": args.offload_optimizer,
+            "offload_parameters": args.offload_parameters,
+            "auto_detect": not args.no_auto_detect,
+            "fp16": True,
+            "gradient_accumulation_steps": 4
+        }
+        
+        # Train with DeepSpeed
+        logger.info("Using DeepSpeed for training")
+        results = train_model_with_deepspeed(
+            model=model,
+            tokenizer=tokenizer,
+            train_df=train_df,
+            eval_df=val_df,
+            output_dir=output_dir,
+            class_weights=None,  # Calculate automatically
+            use_enhanced_prompt=not args.no_enhanced_prompt,
+            deepspeed_config=deepspeed_config
+        )
+    else:
+        # Use regular training
+        results = train_model(
+            model=model,
+            tokenizer=tokenizer,
+            train_df=train_df,
+            eval_df=val_df,
+            output_dir=output_dir,
+            training_args=None,  # Use defaults
+            class_weights=None,  # Calculate automatically
+            use_enhanced_prompt=not args.no_enhanced_prompt
+        )
+    
+    if results:
+        logger.info(f"Training completed successfully")
+        logger.info(f"Model saved to: {output_dir}")
+        logger.info(f"Evaluation results: Accuracy={results['eval_results']['eval_accuracy']:.4f}, F1={results['eval_results']['eval_f1']:.4f}")
+        return True
+    else:
+        logger.error("Training failed")
         return False
 
 def inference_command(args):
@@ -473,7 +636,10 @@ def pipeline_command(args):
         preprocess_args = argparse.Namespace(
             dataset=args.dataset,
             no_balance=False,
-            batch_size=1000
+            batch_size=1000,
+            sample=args.sample,
+            max_samples=args.max_samples,
+            sampling_strategy=args.sampling_strategy
         )
         
         success = preprocess_command(preprocess_args)
@@ -518,12 +684,15 @@ def pipeline_command(args):
     # Step 3: Train with best parameters
     progress.start_step("Training model")
     
+    # Final model will be in MODELS_DIR/dataset_name
+    model_output_dir = os.path.join(MODELS_DIR, args.dataset)
+    
     if best_params is not None:
         # Use best parameters from optimization
         train_args = argparse.Namespace(
             dataset=args.dataset,
             model=args.model,
-            output=os.path.join(output_dir, "model"),
+            output=model_output_dir,
             batch_size=best_params.get("batch_size", 4),
             epochs=10,  # Use more epochs for final training
             learning_rate=best_params.get("learning_rate", 2e-5),
@@ -536,7 +705,7 @@ def pipeline_command(args):
         train_args = argparse.Namespace(
             dataset=args.dataset,
             model=args.model,
-            output=os.path.join(output_dir, "model"),
+            output=model_output_dir,
             batch_size=TRAINING_CONFIG["batch_size"],
             epochs=TRAINING_CONFIG["epochs"],
             learning_rate=TRAINING_CONFIG["learning_rate"],
@@ -559,7 +728,7 @@ def pipeline_command(args):
     evaluate_args = argparse.Namespace(
         dataset=args.dataset,
         split="test",
-        model=os.path.join(output_dir, "model", "final_model"),
+        model=model_output_dir,  # Now this is simple - just use the dataset folder
         output=os.path.join(output_dir, "evaluation"),
         batch_size=8,
         compare=True  # Always run comparison for full pipeline
@@ -575,6 +744,7 @@ def pipeline_command(args):
     # Pipeline completed successfully
     logger.info("Pipeline completed successfully!")
     logger.info(f"All outputs saved to: {output_dir}")
+    logger.info(f"Model saved to: {model_output_dir}")
     
     return True
 

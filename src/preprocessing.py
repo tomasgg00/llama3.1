@@ -82,6 +82,101 @@ def initialize_nlp_models():
         except Exception as e:
             logging.error(f"Error initializing sentiment analyzer: {e}")
 
+def smart_sampling(df, max_samples=None, sampling_strategy='stratified', stratify_column='label', 
+                   estimate_optimal=False, min_samples=1000, random_state=42):
+    """
+    Perform intelligent sampling of a large dataset.
+    
+    Args:
+        df: DataFrame to sample
+        max_samples: Maximum number of samples (or None to estimate optimal)
+        sampling_strategy: 'stratified', 'random', or 'learning_curve'
+        stratify_column: Column to stratify by
+        estimate_optimal: Whether to estimate optimal sample size
+        min_samples: Minimum sample size
+        random_state: Random state for reproducibility
+    
+    Returns:
+        Sampled DataFrame
+    """
+    # If max_samples is None or greater than dataset size, return full dataset
+    if max_samples is None or max_samples >= len(df):
+        logging.info(f"Using full dataset of size {len(df)}")
+        return df
+    
+    # If requested, estimate optimal sample size
+    if estimate_optimal:
+        from sklearn.linear_model import LogisticRegression
+        
+        def lr_model_fn():
+            return LogisticRegression(max_iter=1000, C=1.0, solver='liblinear')
+        
+        logging.info("Estimating optimal sample size...")
+        optimal_sample_size, _ = estimate_optimal_sample_size(
+            df, lr_model_fn, eval_metric='f1'
+        )
+        
+        # Apply constraints
+        optimal_sample_size = max(min_samples, min(optimal_sample_size, max_samples, len(df)))
+        logging.info(f"Using estimated optimal sample size: {optimal_sample_size}")
+        max_samples = optimal_sample_size
+    
+    # Perform sampling based on strategy
+    if sampling_strategy == 'stratified':
+        return create_stratified_sample(df, max_samples, stratify_column, random_state)
+    elif sampling_strategy == 'random':
+        return df.sample(max_samples, random_state=random_state)
+    else:
+        logging.warning(f"Unknown sampling strategy: {sampling_strategy}, using stratified")
+        return create_stratified_sample(df, max_samples, stratify_column, random_state)
+
+def smart_sample_dataset(df, max_samples=None, strategy='stratified', estimate_optimal=False, min_samples=1000):
+    """
+    Apply intelligent sampling to a dataset.
+    
+    Args:
+        df: DataFrame to sample
+        max_samples: Maximum number of samples
+        strategy: 'stratified' or 'random'
+        estimate_optimal: Whether to estimate optimal sample size
+        min_samples: Minimum sample size
+    
+    Returns:
+        Sampled DataFrame
+    """
+    # If optimal sample estimation is requested, use learning curve analysis
+    if estimate_optimal:
+        try:
+            from src.adaptive_scaling import estimate_optimal_sample_size
+            from sklearn.linear_model import LogisticRegression
+            
+            # Create a simple model function for estimation
+            def lr_model_fn():
+                return LogisticRegression(max_iter=1000, C=1.0, solver='liblinear')
+            
+            # Estimate optimal sample size
+            logging.info("Estimating optimal sample size using learning curves...")
+            optimal_size, _ = estimate_optimal_sample_size(df, lr_model_fn, eval_metric='f1')
+            
+            # Apply constraints
+            max_samples = max(min_samples, min(optimal_size, max_samples or float('inf')))
+            logging.info(f"Using optimal sample size: {max_samples}")
+        except Exception as e:
+            logging.error(f"Error estimating optimal sample size: {e}")
+            logging.info("Falling back to requested max_samples")
+    
+    # If no sampling needed, return full dataset
+    if max_samples is None or max_samples >= len(df):
+        return df
+        
+    # Apply stratified sampling if requested
+    if strategy == 'stratified' and 'label' in df.columns:
+        from src.adaptive_scaling import create_stratified_sample
+        return create_stratified_sample(df, max_samples, stratify_column='label')
+    else:
+        # Fall back to random sampling
+        return df.sample(max_samples, random_state=42)
+
 def clean_text(text):
     """Clean and preprocess text efficiently."""
     if not isinstance(text, str):
@@ -485,7 +580,9 @@ def tokenize_dataset(df, tokenizer, max_length=512, batch_size=128):
     
     return df
 
-def load_and_preprocess(dataset_name, tokenizer=None, balance=True, progress_tracker=None):
+def load_and_preprocess(dataset_name, tokenizer=None, balance=True, progress_tracker=None, 
+                       sample_dataset=False, max_samples=100000, 
+                       sampling_strategy='stratified', estimate_optimal=False):
     """
     Load and preprocess a dataset.
     
@@ -494,6 +591,10 @@ def load_and_preprocess(dataset_name, tokenizer=None, balance=True, progress_tra
         tokenizer: Optional tokenizer for text tokenization
         balance: Whether to balance the dataset
         progress_tracker: Optional progress tracker
+        sample_dataset: Whether to sample the dataset
+        max_samples: Maximum number of samples
+        sampling_strategy: 'stratified' or 'random'
+        estimate_optimal: Whether to estimate optimal sample size
     
     Returns:
         Processed dataframe
@@ -569,7 +670,7 @@ def load_and_preprocess(dataset_name, tokenizer=None, balance=True, progress_tra
     if 'label' not in df.columns:
         logging.warning("Dataset missing 'label' column, assuming all examples are negative (0)")
         df['label'] = 0
-    
+
     # Drop duplicates
     initial_count = len(df)
     df.drop_duplicates(subset=['content'], keep='first', inplace=True)
@@ -579,6 +680,18 @@ def load_and_preprocess(dataset_name, tokenizer=None, balance=True, progress_tra
         logging.info(f"Removed {initial_count - dedup_count} duplicate entries")
     
     progress_tracker.complete_step()
+
+    # Apply intelligent sampling if requested
+    if sample_dataset:
+        logging.info(f"Applying {sampling_strategy} sampling with max_samples={max_samples}")
+        df = smart_sample_dataset(
+            df, 
+            max_samples=max_samples, 
+            strategy=sampling_strategy,
+            estimate_optimal=estimate_optimal,
+            min_samples=1000
+        )
+        logging.info(f"Dataset after sampling: {df.shape}")
     
     # Step 2: Initialize NLP models
     progress_tracker.start_step("Initializing NLP models")

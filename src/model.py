@@ -197,7 +197,10 @@ def load_base_model(
     except Exception as e:
         logging.error(f"Error loading base model: {e}")
         return None
-
+    
+    if quantize:
+        logging.info("Using 4-bit quantization with NF4 type and double quantization")
+    
 def prepare_for_lora(model, use_gradient_checkpointing=True):
     """
     Prepare model for LoRA fine-tuning.
@@ -296,14 +299,6 @@ def save_model(model, tokenizer, output_dir, model_name=None):
 def load_model_for_inference(model_path, device=None, adapter_name=None):
     """
     Load a model for inference, including LoRA adapter if applicable.
-    
-    Args:
-        model_path: Path to the model or adapter
-        device: Device to load the model on
-        adapter_name: Optional adapter name for LoRA models
-    
-    Returns:
-        Tuple of (model, tokenizer)
     """
     # Check if model path exists
     if not os.path.exists(model_path):
@@ -314,12 +309,6 @@ def load_model_for_inference(model_path, device=None, adapter_name=None):
         else:
             logging.error(f"Model path not found: {model_path}")
             return None, None
-    
-    # Determine if this is a full model or an adapter
-    is_adapter = (
-        os.path.exists(os.path.join(model_path, "adapter_config.json")) or
-        os.path.exists(os.path.join(model_path, "adapter_model.bin"))
-    )
     
     # Load tokenizer first
     tokenizer = None
@@ -347,21 +336,26 @@ def load_model_for_inference(model_path, device=None, adapter_name=None):
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
     
-    # Load model based on whether it's an adapter or full model
+    # Try a different loading approach - load directly as a full model first
     try:
-        if is_adapter:
-            logging.info(f"Loading base model for adapter: {base_model_name}")
-            
-            # Load the base model with 4-bit quantization
+        # Try to load as a regular model first
+        logging.info(f"Attempting to load as full model from {model_path}")
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_path,
+            device_map="auto" if torch.cuda.is_available() else None
+        )
+        model.eval()
+        logging.info(f"Successfully loaded model for inference")
+        return model, tokenizer
+    except Exception as e:
+        logging.info(f"Could not load as full model, trying adapter approach: {e}")
+        
+        try:
+            # Try the adapter approach as backup
+            logging.info(f"Loading base model: {base_model_name}")
             quantization_config = get_quantization_config()
+            device_map = "auto" if torch.cuda.is_available() else None
             
-            # Configure device
-            if device is None:
-                device_map = "auto" if torch.cuda.is_available() else None
-            else:
-                device_map = device
-            
-            # Load base model
             base_model = AutoModelForSequenceClassification.from_pretrained(
                 base_model_name,
                 num_labels=2,
@@ -370,40 +364,29 @@ def load_model_for_inference(model_path, device=None, adapter_name=None):
                 torch_dtype=torch.float16
             )
             
-            # Ensure pad token is set
             base_model.config.pad_token_id = tokenizer.pad_token_id
             
-            # Load the adapter
-            logging.info(f"Loading adapter from {model_path}")
-            model = PeftModel.from_pretrained(
-                base_model, 
-                model_path,
-                adapter_name=adapter_name
-            )
-        else:
-            # Load full model
-            logging.info(f"Loading full model from {model_path}")
-            
-            # Configure device
-            if device is None:
-                device_map = "auto" if torch.cuda.is_available() else None
+            # Check if adapter files exist
+            if os.path.exists(os.path.join(model_path, "adapter_model.bin")) or \
+               os.path.exists(os.path.join(model_path, "adapter_model.safetensors")):
+                try:
+                    logging.info(f"Loading adapter using direct approach from {model_path}")
+                    # Use a more direct approach to load the adapter
+                    from peft import PeftModel
+                    model = PeftModel.from_pretrained(base_model, model_path)
+                    model.eval()
+                    logging.info(f"Successfully loaded model with adapter")
+                    return model, tokenizer
+                except Exception as e:
+                    logging.error(f"Error loading adapter with direct approach: {e}")
             else:
-                device_map = device
+                logging.error(f"No adapter files found in {model_path}")
             
-            # Load model
-            model = AutoModelForSequenceClassification.from_pretrained(
-                model_path,
-                device_map=device_map
-            )
-        
-        # Set model to evaluation mode
-        model.eval()
-        logging.info(f"Successfully loaded model for inference")
-        
-        return model, tokenizer
-    except Exception as e:
-        logging.error(f"Error loading model for inference: {e}")
-        return None, None
+            # If we reach here, both approaches failed
+            return None, None
+        except Exception as e:
+            logging.error(f"Error loading model: {e}")
+            return None, None
 
 class MisinformationDetectionModel:
     """Model class for misinformation detection."""

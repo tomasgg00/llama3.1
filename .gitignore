@@ -1,0 +1,51 @@
+# Ignore Python virtual environments
+venv/
+mvenv/
+.mvenv/
+misinfo-detection/
+
+# Ignore Python cache files
+__pycache__/
+*.py[cod]
+*.so
+
+# Ignore Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# Ignore logs and temporary files
+logs/
+*.log
+*.out
+*.err
+*.pid
+
+# Ignore data files
+*.csv
+*.db
+*.sqlite3
+*.h5
+
+# Ignore processed data
+results/
+processed_data/
+
+# Ignore environment files
+*.env
+.env
+.DS_Store
+.vscode/
+
+# Ignore model checkpoints
+models/
+checkpoints/
+*.ckpt
+*.sh
+
+# Ignore Python package files
+*.egg-info/
+*.dist-info/
+build/
+dist/
+
+# Ignore VS Code settings
+.vscode/

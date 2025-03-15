@@ -38,6 +38,40 @@ from src.config import (
 )
 from src.model import get_lora_config
 
+def determine_optimal_training_params(model, train_dataset, eval_dataset=None):
+    """
+    Determine optimal training parameters (batch size, etc.) for a given model and dataset.
+    
+    Args:
+        model: Model to train
+        train_dataset: Training dataset
+        eval_dataset: Evaluation dataset
+    
+    Returns:
+        Dictionary with optimal parameters
+    """
+    try:
+        # Import adaptive scaling features
+        from src.adaptive_scaling import determine_optimal_batch_size
+        
+        # Determine optimal batch size
+        optimal_batch_size = determine_optimal_batch_size(
+            model=model,
+            max_sequence_length=512,  # Adjust based on your tokenizer's max length
+            available_memory=None  # Auto-detect
+        )
+        
+        return {
+            "batch_size": optimal_batch_size,
+            "auto_determined": True
+        }
+    except Exception as e:
+        logging.error(f"Error determining optimal training parameters: {e}")
+        return {
+            "batch_size": TRAINING_CONFIG["batch_size"],
+            "auto_determined": False
+        }
+
 class MisinformationTrainer(Trainer):
     """Custom trainer with weighted loss function for misinformation detection."""
     
@@ -58,7 +92,7 @@ class MisinformationTrainer(Trainer):
         # Log training start
         logging.info(f"Initializing trainer with class weights: {class_weights}")
     
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
         Compute loss with optional class weighting.
         
@@ -66,6 +100,7 @@ class MisinformationTrainer(Trainer):
             model: Model to compute loss for
             inputs: Inputs to the model
             return_outputs: Whether to return model outputs
+            num_items_in_batch: Number of items in the batch (for weighted loss)
         
         Returns:
             Loss value, or tuple of (loss, outputs) if return_outputs is True
@@ -149,9 +184,8 @@ class SaveBestModelCallback(EarlyStoppingCallback):
         if self.best_metric is None or (args.greater_is_better and metric_value > self.best_metric) or (not args.greater_is_better and metric_value < self.best_metric):
             self.best_metric = metric_value
             
-            # Save the best model
-            best_dir = os.path.join(self.output_dir, "best_model")
-            os.makedirs(best_dir, exist_ok=True)
+            # Save the best model directly to the output directory (not in a subdirectory)
+            best_dir = self.output_dir
             
             if 'model' in kwargs:
                 model = kwargs['model']
@@ -220,7 +254,8 @@ def train_model(
     output_dir=None,
     training_args=None,
     class_weights=None,
-    use_enhanced_prompt=None
+    use_enhanced_prompt=None,
+    auto_batch_size=False  # Add this parameter
 ):
     """
     Train a model on the given dataset.
@@ -234,6 +269,7 @@ def train_model(
         training_args: Custom training arguments
         class_weights: Optional weights for loss calculation
         use_enhanced_prompt: Whether to use enhanced prompts
+        auto_batch_size: Whether to automatically determine optimal batch size
     
     Returns:
         Dictionary with training results
@@ -244,6 +280,13 @@ def train_model(
         output_dir = os.path.join(MODELS_DIR, f"model_{timestamp}")
     
     os.makedirs(output_dir, exist_ok=True)
+    
+    # Define compute metrics wrapper
+    def compute_metrics_wrapper(eval_pred):
+        """Wrapper for compute_metrics to match Trainer's expected interface"""
+        predictions = eval_pred.predictions
+        labels = eval_pred.label_ids
+        return compute_metrics(predictions, labels)
     
     # Determine whether to use enhanced prompts
     if use_enhanced_prompt is None:
@@ -288,10 +331,22 @@ def train_model(
         logging.info(f"Calculated class weights: {weights}")
         class_weights = weights
     
+    # Determine optimal batch size if requested
+    optimal_batch_size = None
+    if auto_batch_size:
+        logging.info("Determining optimal batch size...")
+        optimal_params = determine_optimal_training_params(model, train_dataset)
+        optimal_batch_size = optimal_params["batch_size"]
+        logging.info(f"Using optimal batch size: {optimal_batch_size}")
+    
     # Set up training arguments
     if training_args is None:
         # Use default configuration
         config = TRAINING_CONFIG.copy()
+        
+        # Update batch size if auto_batch_size is enabled
+        if auto_batch_size and optimal_batch_size is not None:
+            config["batch_size"] = optimal_batch_size
         
         # Calculate training steps and warmup steps
         num_train_samples = len(train_dataset)
@@ -332,6 +387,10 @@ def train_model(
             dataloader_num_workers=0,
             remove_unused_columns=True,
         )
+    elif auto_batch_size and optimal_batch_size is not None:
+        # Update existing training args with optimal batch size
+        training_args.per_device_train_batch_size = optimal_batch_size
+        training_args.per_device_eval_batch_size = optimal_batch_size
     
     # Create custom data collator
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
@@ -356,7 +415,7 @@ def train_model(
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         tokenizer=tokenizer,
-        compute_metrics=compute_metrics,
+        compute_metrics=compute_metrics_wrapper,
         callbacks=callbacks,
         data_collator=data_collator,
         class_weights=class_weights
@@ -395,6 +454,13 @@ def train_model(
             "use_enhanced_prompt": use_enhanced_prompt
         }
     }
+    
+    # Add adaptive batch size info if used
+    if auto_batch_size and optimal_batch_size is not None:
+        results["adaptive_batch_size"] = {
+            "optimal_batch_size": optimal_batch_size,
+            "original_batch_size": TRAINING_CONFIG["batch_size"]
+        }
     
     # Save results
     results_file = os.path.join(output_dir, "training_results.json")
@@ -448,56 +514,63 @@ def objective(
     Returns:
         Optimization score (F1 score)
     """
-    # Create trial directory
-    trial_id = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_trial_{trial.number}"
-    trial_dir = os.path.join(output_dir, trial_id)
-    os.makedirs(trial_dir, exist_ok=True)
-    
-    # Sample hyperparameters
-    search_space = OPTUNA_CONFIG["search_space"]
-    
-    learning_rate = trial.suggest_float(
-        "learning_rate", 
-        search_space["learning_rate"][0], 
-        search_space["learning_rate"][1], 
-        log=True
-    )
-    
-    batch_size = trial.suggest_categorical(
-        "batch_size", 
-        search_space["batch_size"]
-    )
-    
-    lora_r = trial.suggest_categorical(
-        "lora_r", 
-        search_space["lora_r"]
-    )
-    
-    lora_alpha = trial.suggest_categorical(
-        "lora_alpha", 
-        search_space["lora_alpha"]
-    )
-    
-    lora_dropout = trial.suggest_float(
-        "lora_dropout", 
-        search_space["lora_dropout"][0], 
-        search_space["lora_dropout"][1]
-    )
-    
-    use_enhanced_prompt = trial.suggest_categorical(
-        "use_enhanced_prompt", 
-        search_space["use_enhanced_prompt"]
-    )
-    
-    gradient_accumulation_steps = trial.suggest_categorical(
-        "gradient_accumulation_steps", 
-        search_space["gradient_accumulation_steps"]
-    )
-    
-    # Log hyperparameters
-    logging.info(f"Trial {trial.number}: Hyperparameters: {trial.params}")
-    
     try:
+        # Create trial directory
+        trial_id = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_trial_{trial.number}"
+        trial_dir = os.path.join(output_dir, trial_id)
+        os.makedirs(trial_dir, exist_ok=True)
+        
+        # Define compute metrics wrapper
+        def compute_metrics_wrapper(eval_pred):
+            """Wrapper for compute_metrics to match Trainer's expected interface"""
+            predictions = eval_pred.predictions
+            labels = eval_pred.label_ids
+            return compute_metrics(predictions, labels)
+        
+        # Sample hyperparameters
+        search_space = OPTUNA_CONFIG["search_space"]
+        
+        learning_rate = trial.suggest_float(
+            "learning_rate", 
+            search_space["learning_rate"][0], 
+            search_space["learning_rate"][1], 
+            log=True
+        )
+        
+        batch_size = trial.suggest_categorical(
+            "batch_size", 
+            search_space["batch_size"]
+        )
+        
+        lora_r = trial.suggest_categorical(
+            "lora_r", 
+            search_space["lora_r"]
+        )
+        
+        lora_alpha = trial.suggest_categorical(
+            "lora_alpha", 
+            search_space["lora_alpha"]
+        )
+        
+        lora_dropout = trial.suggest_float(
+            "lora_dropout", 
+            search_space["lora_dropout"][0], 
+            search_space["lora_dropout"][1]
+        )
+        
+        use_enhanced_prompt = trial.suggest_categorical(
+            "use_enhanced_prompt", 
+            search_space["use_enhanced_prompt"]
+        )
+        
+        gradient_accumulation_steps = trial.suggest_categorical(
+            "gradient_accumulation_steps", 
+            search_space["gradient_accumulation_steps"]
+        )
+        
+        # Log hyperparameters
+        logging.info(f"Trial {trial.number}: Hyperparameters: {trial.params}")
+        
         # Import here to avoid circular imports
         from src.model import (
             get_tokenizer, load_base_model, prepare_for_lora, apply_lora
@@ -566,7 +639,8 @@ def objective(
             eval_df=eval_df,
             output_dir=trial_dir,
             training_args=training_args,
-            use_enhanced_prompt=use_enhanced_prompt
+            use_enhanced_prompt=use_enhanced_prompt,
+            auto_batch_size=False  # Don't use auto batch size in trials
         )
         
         # Extract F1 score
@@ -711,7 +785,8 @@ def train_with_best_params(
     eval_df,
     base_model_name,
     best_params,
-    output_dir=None
+    output_dir=None,
+    auto_batch_size=False  # Add this parameter
 ):
     """
     Train the final model with the best hyperparameters.
@@ -722,6 +797,7 @@ def train_with_best_params(
         base_model_name: Base model name
         best_params: Best hyperparameters
         output_dir: Output directory
+        auto_batch_size: Whether to automatically determine optimal batch size
     
     Returns:
         Dictionary with training results
@@ -804,7 +880,7 @@ def train_with_best_params(
         lr_scheduler_type="linear",
         learning_rate=learning_rate,
         weight_decay=0.01,
-        logging_dir=os.path.join(output_dir, "logs"),
+        logging_dir=os.path.join(LOGS_DIR, "training_logs"),
         logging_steps=25,
         report_to="none",
         save_total_limit=3,
@@ -837,7 +913,8 @@ def train_with_best_params(
         eval_df=eval_df,
         output_dir=output_dir,
         training_args=training_args,
-        use_enhanced_prompt=use_enhanced_prompt
+        use_enhanced_prompt=use_enhanced_prompt,
+        auto_batch_size=auto_batch_size  # Pass through the auto_batch_size parameter
     )
     
     # Save model configuration and best hyperparameters
@@ -890,6 +967,13 @@ def analyze_errors(model, tokenizer, test_df, output_dir):
     # Run predictions
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
     
+    # Define compute metrics wrapper
+    def compute_metrics_wrapper(eval_pred):
+        """Wrapper for compute_metrics to match Trainer's expected interface"""
+        predictions = eval_pred.predictions
+        labels = eval_pred.label_ids
+        return compute_metrics(predictions, labels)
+    
     trainer = MisinformationTrainer(
         model=model,
         args=TrainingArguments(
@@ -898,7 +982,7 @@ def analyze_errors(model, tokenizer, test_df, output_dir):
             report_to="none"
         ),
         tokenizer=tokenizer,
-        compute_metrics=compute_metrics,
+        compute_metrics=compute_metrics_wrapper,
         data_collator=data_collator
     )
     
@@ -1001,3 +1085,419 @@ def analyze_errors(model, tokenizer, test_df, output_dir):
     
     logging.info(f"Error analysis saved to {analysis_file}")
     return error_analysis
+
+
+# Add to the bottom of your training.py file or as a new function
+
+def train_model_with_deepspeed(
+    model,
+    tokenizer,
+    train_df,
+    eval_df=None,
+    output_dir=None,
+    training_args=None,
+    class_weights=None,
+    use_enhanced_prompt=None,
+    deepspeed_config=None
+):
+    """
+    Train a model using DeepSpeed for distributed and optimized training.
+    This is an extension of the train_model function with DeepSpeed integration.
+    
+    Args:
+        model: Model to train
+        tokenizer: Tokenizer for encoding
+        train_df: Training dataset
+        eval_df: Evaluation dataset
+        output_dir: Directory to save model to
+        training_args: Custom training arguments
+        class_weights: Optional weights for loss calculation
+        use_enhanced_prompt: Whether to use enhanced prompts
+        deepspeed_config: DeepSpeed configuration
+        
+    Returns:
+        Dictionary with training results
+    """
+    import deepspeed
+    from src.config import DEEPSPEED_CONFIG, TRAINING_CONFIG
+    
+    # Set default output directory
+    if output_dir is None:
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = os.path.join(MODELS_DIR, f"model_deepspeed_{timestamp}")
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Use config from parameter or fall back to defaults
+    ds_config = deepspeed_config or DEEPSPEED_CONFIG
+    
+    # Auto-detect optimal settings if enabled
+    if ds_config.get("auto_detect", True):
+        try:
+            ds_config = _auto_detect_deepspeed_config(model)
+        except Exception as e:
+            logging.warning(f"Error in auto-detecting DeepSpeed config: {e}")
+            # Continue with defaults
+    
+    # Create DeepSpeed config file
+    ds_config_file = os.path.join(output_dir, "ds_config.json")
+    deepspeed_config_dict = _create_deepspeed_config_dict(
+        zero_stage=ds_config.get("zero_stage", 2),
+        offload_optimizer=ds_config.get("offload_optimizer", False),
+        offload_parameters=ds_config.get("offload_parameters", False),
+        gradient_accumulation_steps=ds_config.get("gradient_accumulation_steps", 4),
+        fp16=ds_config.get("fp16", True)
+    )
+    
+    # Save config to file
+    with open(ds_config_file, 'w') as f:
+        import json
+        json.dump(deepspeed_config_dict, f, indent=2)
+    
+    # Set up DeepSpeed training arguments
+    if training_args is None:
+        # Use default configuration with DeepSpeed
+        config = TRAINING_CONFIG.copy()
+        
+        # Update with DeepSpeed-appropriate batch size
+        from src.config import determine_optimal_batch_size_with_deepspeed
+        config["batch_size"] = determine_optimal_batch_size_with_deepspeed(model)
+        
+        from transformers import TrainingArguments
+        training_args = TrainingArguments(
+            output_dir=output_dir,
+            evaluation_strategy="steps",
+            eval_steps=config["eval_steps"],
+            save_strategy="steps",
+            save_steps=config["save_steps"],
+            per_device_train_batch_size=config["batch_size"],
+            per_device_eval_batch_size=config["batch_size"],
+            gradient_accumulation_steps=ds_config.get("gradient_accumulation_steps", 4),
+            num_train_epochs=config["epochs"],
+            fp16=ds_config.get("fp16", True),
+            gradient_checkpointing=True,
+            warmup_ratio=config["warmup_ratio"],
+            lr_scheduler_type="linear",
+            learning_rate=config["learning_rate"],
+            weight_decay=config["weight_decay"],
+            logging_dir=os.path.join(LOGS_DIR, "training_logs"),
+            logging_steps=25,
+            report_to="none",
+            save_total_limit=3,
+            load_best_model_at_end=True,
+            metric_for_best_model="f1",
+            greater_is_better=True,
+            dataloader_pin_memory=True,
+            dataloader_num_workers=0,  # Recommended for DeepSpeed
+            remove_unused_columns=True,
+            deepspeed=ds_config_file  # Add DeepSpeed config
+        )
+    else:
+        # Update existing training args with DeepSpeed config
+        training_args.deepspeed = ds_config_file
+        
+    # Determine whether to use enhanced prompts
+    if use_enhanced_prompt is None:
+        use_enhanced_prompt = TRAINING_CONFIG["use_enhanced_prompt"]
+    
+    # Prepare datasets
+    logging.info("Preparing datasets for training with DeepSpeed")
+    
+    train_dataset = prepare_dataset_for_training(
+        train_df, tokenizer, use_enhanced_prompt=use_enhanced_prompt
+    )
+    
+    if eval_df is not None:
+        eval_dataset = prepare_dataset_for_training(
+            eval_df, tokenizer, use_enhanced_prompt=use_enhanced_prompt
+        )
+    else:
+        # Use a portion of training data for evaluation if no eval set provided
+        dataset_dict = train_dataset.train_test_split(test_size=0.1, seed=42)
+        train_dataset = dataset_dict["train"]
+        eval_dataset = dataset_dict["test"]
+    
+    # Define compute metrics wrapper
+    def compute_metrics_wrapper(eval_pred):
+        """Wrapper for compute_metrics to match Trainer's expected interface"""
+        predictions = eval_pred.predictions
+        labels = eval_pred.label_ids
+        return compute_metrics(predictions, labels)
+    
+    # Add callbacks
+    callbacks = [
+        EarlyStoppingCallback(
+            early_stopping_patience=5,  # Increased patience for DeepSpeed
+            early_stopping_threshold=0.002
+        ),
+        SaveBestModelCallback(
+            output_dir=output_dir,
+            early_stopping_patience=5,
+            early_stopping_threshold=0.002
+        )
+    ]
+    
+    # Create trainer
+    trainer = MisinformationTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        tokenizer=tokenizer,
+        compute_metrics=compute_metrics_wrapper,
+        callbacks=callbacks,
+        data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
+        class_weights=class_weights
+    )
+    
+    # Start training
+    logging.info("Starting DeepSpeed training")
+    import time
+    start_time = time.time()
+    trainer.train()
+    training_time = time.time() - start_time
+    
+    # Final evaluation
+    logging.info("Performing final evaluation")
+    eval_results = trainer.evaluate()
+    
+    # Save model
+    logging.info("Saving trained model")
+    trainer.save_model(os.path.join(output_dir, "final_model"))
+    tokenizer.save_pretrained(os.path.join(output_dir, "final_model"))
+    
+    # Get efficiency metrics
+    efficiency_metrics = trainer.get_efficiency_metrics()
+    
+    # Combine metrics
+    results = {
+        "training_time": training_time,
+        "training_time_formatted": format_time(training_time),
+        "samples_per_second": len(train_dataset) / training_time,
+        "eval_results": eval_results,
+        "efficiency_metrics": efficiency_metrics,
+        "hyperparameters": {
+            "learning_rate": training_args.learning_rate,
+            "batch_size": training_args.per_device_train_batch_size,
+            "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
+            "epochs": training_args.num_train_epochs,
+            "use_enhanced_prompt": use_enhanced_prompt
+        },
+        "deepspeed_config": {
+            "zero_stage": ds_config.get("zero_stage", 2),
+            "offload_optimizer": ds_config.get("offload_optimizer", False),
+            "offload_parameters": ds_config.get("offload_parameters", False)
+        }
+    }
+    
+    # Save results
+    results_file = os.path.join(output_dir, "training_results.json")
+    save_json(results, results_file)
+    
+    # Generate metrics visualization
+    try:
+        # Run predictions on evaluation dataset
+        predictions = trainer.predict(eval_dataset)
+        y_true = predictions.label_ids
+        y_pred = np.argmax(predictions.predictions, axis=1)
+        
+        # Create confusion matrix visualization
+        cm_path = os.path.join(output_dir, "confusion_matrix.png")
+        visualize_confusion_matrix(
+            y_true, 
+            y_pred,
+            output_path=cm_path, 
+            title="Confusion Matrix for Misinformation Detection"
+        )
+        
+        # Add visualization paths to results
+        results["visualizations"] = {
+            "confusion_matrix": cm_path
+        }
+    except Exception as e:
+        logging.error(f"Error generating visualizations: {e}")
+    
+    logging.info(f"DeepSpeed training completed. Results saved to {results_file}")
+    return results
+
+def _auto_detect_deepspeed_config(model):
+    """
+    Auto-detect the best DeepSpeed configuration based on model size and hardware.
+    
+    Args:
+        model: The model to analyze
+        
+    Returns:
+        DeepSpeed configuration dictionary
+    """
+    import torch
+    
+    # Determine model size
+    model_size_category = "medium"  # Default
+    model_name = getattr(model, "name_or_path", None)
+    if model_name is None and hasattr(model, "config"):
+        model_name = getattr(model.config, "name_or_path", "unknown")
+    
+    if "70B" in model_name:
+        model_size_category = "xlarge"
+    elif "13B" in model_name or "20B" in model_name or "30B" in model_name:
+        model_size_category = "large"
+    elif "7B" in model_name or "8B" in model_name:
+        model_size_category = "medium"
+    elif "3B" in model_name or "1.5B" in model_name:
+        model_size_category = "small"
+    
+    # Get GPU info
+    available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    available_memory = None
+    
+    if torch.cuda.is_available():
+        try:
+            available_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # GB
+        except:
+            available_memory = 16  # Assume 16GB
+    
+    # Configure based on model size and hardware
+    config = {
+        "zero_stage": 2,
+        "offload_optimizer": False,
+        "offload_parameters": False,
+        "gradient_accumulation_steps": 4,
+        "fp16": True
+    }
+    
+    # Single GPU optimizations
+    if available_gpus <= 1:
+        if model_size_category == "xlarge":
+            # 70B models need the most optimization
+            config.update({
+                "zero_stage": 3,
+                "offload_optimizer": True,
+                "offload_parameters": True,
+                "gradient_accumulation_steps": 16
+            })
+        elif model_size_category == "large":
+            # 13B models need significant optimization
+            config.update({
+                "zero_stage": 3,
+                "offload_optimizer": True,
+                "gradient_accumulation_steps": 8
+            })
+    # Multi-GPU optimizations
+    else:
+        if model_size_category == "xlarge":
+            # 70B models with multiple GPUs
+            config.update({
+                "zero_stage": 3,
+                "gradient_accumulation_steps": max(1, 8 // available_gpus)
+            })
+        elif model_size_category == "large":
+            # 13B models with multiple GPUs
+            config.update({
+                "zero_stage": 2,
+                "gradient_accumulation_steps": max(1, 4 // available_gpus)
+            })
+    
+    return config
+
+def _create_deepspeed_config_dict(
+    zero_stage=2,
+    offload_optimizer=False,
+    offload_parameters=False,
+    gradient_accumulation_steps=1,
+    fp16=True
+):
+    """
+    Create a DeepSpeed configuration dictionary.
+    
+    Args:
+        zero_stage: ZeRO optimization stage (0, 1, 2, or 3)
+        offload_optimizer: Whether to offload optimizer states to CPU
+        offload_parameters: Whether to offload parameters to CPU (ZeRO-3 only)
+        gradient_accumulation_steps: Number of gradient accumulation steps
+        fp16: Whether to use mixed precision training
+        
+    Returns:
+        DeepSpeed configuration dictionary
+    """
+    # Base DeepSpeed configuration
+    config = {
+        "train_batch_size": "auto",
+        "train_micro_batch_size_per_gpu": "auto",
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        
+        "optimizer": {
+            "type": "AdamW",
+            "params": {
+                "lr": "auto",
+                "betas": [0.9, 0.999],
+                "eps": 1e-8,
+                "weight_decay": "auto"
+            }
+        },
+        
+        "scheduler": {
+            "type": "WarmupLR",
+            "params": {
+                "warmup_min_lr": 0,
+                "warmup_max_lr": "auto",
+                "warmup_num_steps": "auto"
+            }
+        },
+        
+        "gradient_clipping": 1.0,
+        "steps_per_print": 100,
+        "wall_clock_breakdown": False
+    }
+    
+    # Add FP16 mixed precision settings
+    if fp16:
+        config["fp16"] = {
+            "enabled": True,
+            "auto_cast": True,
+            "loss_scale": 0,
+            "initial_scale_power": 16,
+            "loss_scale_window": 1000,
+            "hysteresis": 2,
+            "min_loss_scale": 1
+        }
+    
+    # Configure ZeRO optimization
+    zero_config = {"stage": zero_stage}
+    
+    # Stage 3 specific configurations
+    if zero_stage == 3:
+        zero_config.update({
+            "offload_optimizer": {
+                "device": "cpu" if offload_optimizer else "none"
+            },
+            "offload_param": {
+                "device": "cpu" if offload_parameters else "none"
+            },
+            "overlap_comm": True,
+            "contiguous_gradients": True,
+            "reduce_bucket_size": 5e8,
+            "stage3_prefetch_bucket_size": 5e8,
+            "stage3_param_persistence_threshold": 1e6,
+            "stage3_max_live_parameters": 1e9,
+            "stage3_max_reuse_distance": 1e9,
+            "stage3_gather_16bit_weights_on_model_save": True
+        })
+    
+    # Stage 1 & 2 offloading configs
+    elif offload_optimizer and (zero_stage == 1 or zero_stage == 2):
+        zero_config.update({
+            "offload_optimizer": {
+                "device": "cpu",
+                "pin_memory": True
+            },
+            "allgather_partitions": True,
+            "allgather_bucket_size": 5e8,
+            "reduce_scatter": True,
+            "reduce_bucket_size": 5e8,
+        })
+    
+    config["zero_optimization"] = zero_config
+    
+    return config

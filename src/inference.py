@@ -120,27 +120,22 @@ def ensemble_inference(model, tokenizer, text, features=None, num_runs=5, device
     return result
 
 def batch_inference(model, tokenizer, texts, features_list=None, batch_size=8, device=None, use_enhanced_prompt=False):
-    """
-    Process a batch of texts efficiently for inference.
-    
-    Args:
-        model: The fine-tuned model
-        tokenizer: The tokenizer
-        texts: List of texts to classify
-        features_list: Optional list of feature dictionaries for enhanced prompting
-        batch_size: Batch size for processing
-        device: Device to run inference on
-        use_enhanced_prompt: Whether to use enhanced prompts
-    
-    Returns:
-        List of prediction results
-    """
+    """Process a batch of texts efficiently for inference."""
     # Ensure model is in evaluation mode
     model.eval()
     
     # Configure device
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Ensure padding token is set
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+        model.config.pad_token_id = tokenizer.pad_token_id
+    
+    # Process texts one by one if batch size issues persist
+    batch_size = 1  # Force batch size of 1 to avoid padding issues
     
     results = []
     
